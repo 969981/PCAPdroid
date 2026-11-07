@@ -1,0 +1,218 @@
+name: Sync upstream and publish changed builds
+
+on:
+  schedule:
+    # Every 6 hours. GitHub cron uses UTC.
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      publish_current:
+        description: 'Also publish the current upstream commits (initial bootstrap)'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches:
+      - 1.9.x
+    paths:
+      - .github/workflows/upstream-sync-release.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync ${{ matrix.branch }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [master, 1.9.x]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 1.9.x
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch and merge upstream safely
+        env:
+          BRANCH: ${{ matrix.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/emanuele-f/PCAPdroid.git
+          git fetch --no-tags upstream "+refs/heads/$BRANCH:refs/remotes/upstream/$BRANCH"
+          git fetch --no-tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+
+          old=$(git rev-parse "refs/remotes/origin/$BRANCH")
+          incoming=$(git rev-parse "refs/remotes/upstream/$BRANCH")
+          echo "Local $BRANCH: $old"
+          echo "Upstream $BRANCH: $incoming"
+
+          if git merge-base --is-ancestor "$incoming" "$old"; then
+            echo "Already contains upstream $BRANCH; no push required."
+            exit 0
+          fi
+
+          if ! git merge-base "$old" "$incoming" >/dev/null; then
+            echo "::error::No common ancestor. Refusing to overwrite local history."
+            exit 1
+          fi
+
+          if [[ "$BRANCH" == "master" ]] && ! git merge-base --is-ancestor "$old" "$incoming"; then
+            echo "::error::Local master diverged. Refusing to overwrite user modifications."
+            exit 1
+          fi
+
+          git checkout -B "$BRANCH" "refs/remotes/origin/$BRANCH"
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              merge --no-edit "refs/remotes/upstream/$BRANCH"
+          git push origin "HEAD:refs/heads/$BRANCH"
+
+  publish:
+    name: Build and publish ${{ matrix.branch }} if changed
+    needs: sync
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - branch: master
+            initial_sha: 135b32d771692002b479463c8b52fc20425f4e9d
+          - branch: 1.9.x
+            initial_sha: 02f6f108dd3323c8623512a7816490ff1c21f7ea
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect unpublished upstream revision
+        id: detect
+        shell: bash
+        env:
+          BRANCH: ${{ matrix.branch }}
+          INITIAL_SHA: ${{ matrix.initial_sha }}
+          PUBLISH_CURRENT: ${{ inputs.publish_current }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/emanuele-f/PCAPdroid.git "+refs/heads/$BRANCH:refs/remotes/upstream/$BRANCH"
+          git fetch --no-tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+          incoming=$(git rev-parse "refs/remotes/upstream/$BRANCH")
+
+          # A source branch may have advanced after the sync job; retry at next run.
+          if ! git merge-base --is-ancestor "$incoming" "refs/remotes/origin/$BRANCH"; then
+            echo "::notice::New upstream commit not yet mirrored; deferring release."
+            exit 0
+          fi
+
+          if [[ "$incoming" == "$INITIAL_SHA" && "$PUBLISH_CURRENT" != "true" ]]; then
+            echo "Initial upstream baseline; no new changes, no release."
+            exit 0
+          fi
+
+          short=$(printf '%s' "$incoming" | cut -c1-12)
+          slug=${BRANCH//./-}
+          tag="upstream-$slug-$short"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; skipping."
+            exit 0
+          fi
+
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$incoming" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Upstream changed: $BRANCH at $incoming; publish as $tag"
+
+      - name: Checkout exact upstream source
+        if: steps.detect.outputs.publish == 'true'
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.detect.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git checkout --detach "$SOURCE_SHA"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - uses: actions/setup-java@v4
+        if: steps.detect.outputs.publish == 'true'
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+        if: steps.detect.outputs.publish == 'true'
+
+      - name: Install Android SDK dependencies
+        if: steps.detect.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-35" "platforms;android-37" "ndk;28.2.13676358" "cmake;3.22.1"
+
+      - name: Test and assemble installable debug APK
+        if: steps.detect.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon test assembleStandardDebug
+
+      - name: Prepare release assets
+        if: steps.detect.outputs.publish == 'true'
+        id: assets
+        shell: bash
+        env:
+          BRANCH: ${{ matrix.branch }}
+          SOURCE_SHA: ${{ steps.detect.outputs.sha }}
+        run: |
+          set -euo pipefail
+          source_apk=$(find app/build/outputs/apk/standard/debug -maxdepth 1 -type f -name '*.apk' -print -quit)
+          test -n "$source_apk"
+          short=$(printf '%s' "$SOURCE_SHA" | cut -c1-12)
+          apk="$RUNNER_TEMP/PCAPdroid-$BRANCH-$short-debug.apk"
+          cp "$source_apk" "$apk"
+          (cd "$RUNNER_TEMP" && sha256sum "$(basename "$apk")" > "$(basename "$apk").sha256")
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.detect.outputs.publish == 'true'
+        with:
+          name: pcapdroid-${{ matrix.branch }}-${{ github.run_id }}
+          path: |
+            ${{ steps.assets.outputs.apk }}
+            ${{ steps.assets.outputs.apk }}.sha256
+          retention-days: 14
+
+      - name: Create GitHub pre-release with APK
+        if: steps.detect.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ matrix.branch }}
+          SOURCE_SHA: ${{ steps.detect.outputs.sha }}
+          TAG: ${{ steps.detect.outputs.tag }}
+          APK_PATH: ${{ steps.assets.outputs.apk }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes=$(printf 'Automated upstream snapshot build, not an official PCAPdroid release.\n\nUpstream: https://github.com/emanuele-f/PCAPdroid/tree/%s\nUpstream commit: https://github.com/emanuele-f/PCAPdroid/commit/%s\n\nIncludes standard debug APK (package suffix .debug); built by GitHub Actions, not signed with the official release key.\n' "$BRANCH" "$SOURCE_SHA")
+          gh release create "$TAG" "$APK_PATH" "$APK_PATH.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "PCAPdroid $BRANCH $SOURCE_SHA (auto build)" \
+            --notes "$notes" \
+            --prerelease
