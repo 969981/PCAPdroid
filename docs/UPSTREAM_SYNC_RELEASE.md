@@ -11,7 +11,7 @@
 
 Workflow: [upstream-sync-release.yml](../.github/workflows/upstream-sync-release.yml)
 
-- Check every six hours at minute 17 UTC (01:17, 07:17, 13:17, 19:17 Asia/Singapore).
+- Check every six hours at minute 17 UTC (02:17, 08:17, 14:17, 20:17 Asia/Singapore).
 - Also support **Actions → Sync upstream and publish changed builds → Run workflow**.
 - On its initial installation the source SHAs are treated as baselines and do not trigger releases.
 - Manually select `publish_current=true` to build/publish the current source even if unchanged since the initial baseline.
